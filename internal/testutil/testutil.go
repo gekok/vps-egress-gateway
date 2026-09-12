@@ -77,6 +77,7 @@ type FakeUpstream struct {
 	Username   string
 	Password   string
 	GotAuth    []string
+	GotDest    []string
 	mu         sync.Mutex
 	wg         sync.WaitGroup
 	closed     chan struct{}
@@ -156,6 +157,7 @@ func (f *FakeUpstream) handle(conn net.Conn) {
 	}
 	f.mu.Lock()
 	f.GotAuth = append(f.GotAuth, auth)
+	f.GotDest = append(f.GotDest, dest)
 	f.mu.Unlock()
 	if f.Username != "" {
 		want := "Basic " + base64.StdEncoding.EncodeToString([]byte(f.Username+":"+f.Password))
@@ -166,10 +168,6 @@ func (f *FakeUpstream) handle(conn net.Conn) {
 	}
 	switch f.Mode {
 	case "ok":
-		extra := ""
-		if strings.HasPrefix(dest, "buffered") || true {
-		}
-		_ = extra
 		io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 		if f.TargetAddr != "" {
 			up, err := net.DialTimeout("tcp", f.TargetAddr, 5*time.Second)
@@ -326,6 +324,77 @@ func StartTLSEchoServer(t *testing.T, marker string) (string, []byte) {
 		}
 	}()
 	return ln.Addr().String(), caPEM
+}
+
+// Destinations returns the CONNECT targets this fake upstream was asked for.
+func (f *FakeUpstream) Destinations() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.GotDest...)
+}
+
+// StartSilentTCP accepts connections and then never writes a byte, modelling an
+// upstream that completes the TCP handshake and then goes dark.
+func StartSilentTCP(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen silent: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	var mu sync.Mutex
+	var held []net.Conn
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		mu.Lock()
+		for _, c := range held {
+			c.Close()
+		}
+		mu.Unlock()
+	})
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// StartUnterminatedHeader answers a CONNECT with bytes that never contain a
+// newline, modelling an upstream that can exhaust a naive line reader.
+func StartUnterminatedHeader(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen unterminated: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				junk := []byte(strings.Repeat("A", 4096))
+				for {
+					conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+					if _, err := conn.Write(junk); err != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	}()
+	return ln.Addr().String()
 }
 
 var _ = access.SystemResolver

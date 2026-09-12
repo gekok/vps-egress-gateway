@@ -2,9 +2,11 @@ package access
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/gekok/vps-egress-gateway/internal/config"
@@ -93,21 +95,10 @@ func Authenticate(cfg *config.Config, proxyAuth string) (AuthResult, error) {
 	if !ok {
 		return AuthResult{}, fmt.Errorf("unknown client")
 	}
-	if subtleCompare(want, secret) != true {
+	if subtle.ConstantTimeCompare([]byte(want), []byte(secret)) != 1 {
 		return AuthResult{}, fmt.Errorf("invalid client secret")
 	}
 	return AuthResult{ClientID: id}, nil
-}
-
-func subtleCompare(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var v byte
-	for i := 0; i < len(a); i++ {
-		v |= a[i] ^ b[i]
-	}
-	return v == 0
 }
 
 type Target struct {
@@ -137,13 +128,10 @@ func ParseAuthority(authority string, defaultPort int, allowedPorts map[int]stru
 		if portStr == "" {
 			port = defaultPort
 		} else {
-			var p int
-			for _, c := range portStr {
-				if c < '0' || c > '9' {
-					return "", 0, fmt.Errorf("invalid port")
-				}
+			p, err := strconv.Atoi(portStr)
+			if err != nil {
+				return "", 0, fmt.Errorf("invalid port")
 			}
-			fmt.Sscanf(portStr, "%d", &p)
 			port = p
 		}
 	}
@@ -230,45 +218,60 @@ func IsPublicIP(ip net.IP) bool {
 	if ip.IsPrivate() {
 		return false
 	}
-	if isCGNATOrReserved(ip) {
-		return false
-	}
-	if ip.Equal(net.ParseIP("169.254.169.254")) {
-		return false
-	}
-	return true
+	return !isReservedIP(ip)
 }
 
-func isCGNATOrReserved(ip net.IP) bool {
-	v4 := ip.To4()
-	if v4 == nil {
-		if ip.Equal(net.IPv6unspecified) || ip.IsUnspecified() {
+// reservedNets are ranges a destination must never resolve to. Beyond the
+// obvious private space that net.IP already classifies, this covers the IPv6
+// transition formats: each of them embeds an IPv4 address that a dual-stack
+// upstream can route back into private space, so a fail-closed filter that only
+// looks at the IPv6 bits would wave them through.
+var reservedNets = mustParseCIDRs(
+	// IPv4
+	"0.0.0.0/8",        // this network
+	"100.64.0.0/10",    // CGNAT
+	"169.254.0.0/16",   // link-local, includes 169.254.169.254 metadata
+	"192.0.0.0/24",     // IETF protocol assignments
+	"192.0.2.0/24",     // TEST-NET-1
+	"198.51.100.0/24",  // TEST-NET-2
+	"203.0.113.0/24",   // TEST-NET-3
+	"192.88.99.0/24",   // 6to4 relay anycast
+	"198.18.0.0/15",    // benchmarking
+	"192.175.48.0/24",  // AS112 direct delegation
+	"240.0.0.0/4",      // reserved, includes 255.255.255.255 broadcast
+	"168.63.129.16/32", // Azure wireserver metadata
+	// IPv6
+	"::/128",          // unspecified
+	"::/96",           // IPv4-compatible (deprecated)
+	"::ffff:0:0:0/96", // IPv4-translated
+	"64:ff9b::/96",    // NAT64 well-known prefix
+	"64:ff9b:1::/48",  // NAT64 local-use prefix
+	"100::/64",        // discard-only
+	// 2001::/23 is the IETF protocol assignments block: Teredo (2001::/32),
+	// benchmarking (2001:2::/48), ORCHID (2001:10::/28) and ORCHIDv2
+	// (2001:20::/28) all sit inside it, and so will future assignments.
+	"2001::/23",
+	"2001:db8::/32", // documentation
+	"2002::/16",     // 6to4 (deprecated)
+)
+
+func mustParseCIDRs(cidrs ...string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			panic("access: bad reserved CIDR " + c + ": " + err.Error())
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+func isReservedIP(ip net.IP) bool {
+	for _, n := range reservedNets {
+		if n.Contains(ip) {
 			return true
 		}
-		return false
-	}
-	a, b, c, d := v4[0], v4[1], v4[2], v4[3]
-	_ = d
-	if a == 100 && b >= 64 && b <= 127 {
-		return true
-	}
-	if a == 169 && b == 254 {
-		return true
-	}
-	if a == 192 && b == 0 && c == 2 {
-		return true
-	}
-	if a == 198 && b == 51 && c == 100 {
-		return true
-	}
-	if a == 203 && b == 0 && c == 113 {
-		return true
-	}
-	if a == 192 && b == 88 && c == 99 {
-		return true
-	}
-	if a == 0 {
-		return true
 	}
 	return false
 }

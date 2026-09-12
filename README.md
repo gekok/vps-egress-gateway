@@ -26,7 +26,9 @@ export GATEWAY_UPSTREAM_PASS='upstream-pass'
 
 Default listen is loopback only (`127.0.0.1:8080`). Config fails startup on:
 bad listener, missing client/env secret, duplicate client, empty allowlist,
-unsupported upstream protocol, bad limits/timeouts, unreadable CA file.
+unsupported upstream protocol, bad limits/timeouts, unreadable CA file,
+`default_port` missing from `allowed_ports` (every portless CONNECT would 403),
+and an `upstream.host` that is not a bare hostname or IP.
 
 ## Client use
 
@@ -36,7 +38,13 @@ curl -x http://pc-01:$GATEWAY_CLIENT_PC_01_SECRET@127.0.0.1:8080 https://example
 
 Only allowlisted hostnames and allowed ports are accepted. DNS is resolved at
 the gateway and pinned to a public IP. Private/loopback/link-local/metadata
-addresses fail closed. No direct fallback to destination.
+addresses fail closed, including the IPv6 transition formats that embed an IPv4
+address (6to4, NAT64, IPv4-compatible and IPv4-translated), reserved ranges and
+cloud metadata addresses. No direct fallback to destination.
+
+Allowlist entries are hostnames or bare IP literals, IPv4 or IPv6
+(`2606:4700:4700::1111`); an entry carrying a port is rejected. An IPv6 target
+is written `[addr]:port` in the CONNECT authority.
 
 ## Run tests
 
@@ -59,7 +67,9 @@ No provider key or Internet required.
 5. Troubleshoot: 407 means client auth failed; 403 means host/port/DNS policy
 rejected; 502/504 means upstream failed; 429/503 means limits; check redacted
 gateway logs without secrets.
-6. Stop with SIGINT/SIGTERM; server drains tunnels then force-closes leftovers.
+6. Stop with SIGINT/SIGTERM; the server stops accepting, waits out live tunnels,
+then force-closes both legs of whatever is left so shutdown cannot hang on an
+idle tunnel or a silent upstream.
 
 Local success does not prove Internet IP masking. Multi-PC Internet
 verification is deferred to M2 after M1 acceptance and infra decisions.

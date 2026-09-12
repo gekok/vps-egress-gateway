@@ -71,3 +71,63 @@ func TestLoadRejectsBadProtocol(t *testing.T) {
 		t.Fatalf("expected protocol rejection")
 	}
 }
+
+func TestAllowlistAcceptsIPv6LiteralRejectsPortedEntry(t *testing.T) {
+	good := `{"listen_addr": "[::1]:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com", "2606:4700:4700::1111"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	p := writeTempConfig(t, good, map[string]string{"S": "x"})
+	if _, err := Load(p); err != nil {
+		t.Fatalf("IPv6 allowlist entry rejected: %v", err)
+	}
+
+	bad := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com:443"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	p2 := writeTempConfig(t, bad, map[string]string{"S": "x"})
+	if _, err := Load(p2); err == nil {
+		t.Fatalf("expected rejection of an allowlist entry carrying a port")
+	}
+}
+
+func TestIPv6LoopbackListenerAccepted(t *testing.T) {
+	cfg := `{"listen_addr": "[::1]:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	p := writeTempConfig(t, cfg, map[string]string{"S": "x"})
+	if _, err := Load(p); err != nil {
+		t.Fatalf("IPv6 loopback listener rejected: %v", err)
+	}
+
+	public := `{"listen_addr": "[2606:4700:4700::1111]:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	p2 := writeTempConfig(t, public, map[string]string{"S": "x"})
+	if _, err := Load(p2); err == nil {
+		t.Fatalf("expected rejection of a public IPv6 listener")
+	}
+}
+
+func TestRejectsDefaultPortOutsideAllowedPorts(t *testing.T) {
+	bad := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com"], "allowed_ports": [8443], "default_port": 443, "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	p := writeTempConfig(t, bad, map[string]string{"S": "x"})
+	if _, err := Load(p); err == nil {
+		t.Fatalf("expected rejection: every portless CONNECT would 403")
+	}
+
+	good := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com"], "allowed_ports": [443, 8443], "default_port": 443, "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	p2 := writeTempConfig(t, good, map[string]string{"S": "x"})
+	if _, err := Load(p2); err != nil {
+		t.Fatalf("valid port set rejected: %v", err)
+	}
+}
+
+func TestRejectsBracketedUpstreamHost(t *testing.T) {
+	bad := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com"], "upstream": {"protocol": "http", "host": "[2606:4700:4700::1111]", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	p := writeTempConfig(t, bad, map[string]string{"S": "x"})
+	if _, err := Load(p); err == nil {
+		t.Fatalf("expected rejection of a bracketed upstream host")
+	}
+}
+
+func TestExampleConfigValidates(t *testing.T) {
+	t.Setenv("GATEWAY_CLIENT_PC_01_SECRET", "a")
+	t.Setenv("GATEWAY_CLIENT_PC_02_SECRET", "b")
+	t.Setenv("GATEWAY_UPSTREAM_USER", "u")
+	t.Setenv("GATEWAY_UPSTREAM_PASS", "p")
+	if _, err := Load("../../config.example.json"); err != nil {
+		t.Fatalf("config.example.json does not validate: %v", err)
+	}
+}

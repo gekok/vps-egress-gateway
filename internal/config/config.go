@@ -54,14 +54,6 @@ type Config struct {
 	Timeouts     Timeouts `json:"timeouts"`
 }
 
-func (c *Config) clientSecrets() map[string]string {
-	m := make(map[string]string, len(c.Clients))
-	for _, cl := range c.Clients {
-		m[cl.ID] = os.Getenv(cl.SecretEnv)
-	}
-	return m
-}
-
 func (c *Config) ClientSecret(id string) (string, bool) {
 	for _, cl := range c.Clients {
 		if cl.ID == id {
@@ -132,7 +124,12 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid config: allowlist must not be empty")
 	}
 	for _, h := range c.Allowlist {
-		if strings.TrimSpace(h) == "" || strings.ContainsAny(h, " /:@?#") {
+		if strings.TrimSpace(h) == "" || strings.ContainsAny(h, " /@?#") {
+			return fmt.Errorf("invalid config: bad allowlist entry")
+		}
+		// A colon is only legal in an IPv6 literal; anywhere else it means the
+		// entry carries a port or scheme, which the allowlist must not.
+		if strings.Contains(h, ":") && net.ParseIP(strings.Trim(h, "[]")) == nil {
 			return fmt.Errorf("invalid config: bad allowlist entry")
 		}
 	}
@@ -142,10 +139,19 @@ func (c *Config) Validate() error {
 	if c.AllowedPorts == nil {
 		c.AllowedPorts = []int{c.DefaultPort}
 	}
+	defaultAllowed := false
 	for _, p := range c.AllowedPorts {
 		if p <= 0 || p > 65535 {
 			return fmt.Errorf("invalid config: bad allowed port")
 		}
+		if p == c.DefaultPort {
+			defaultAllowed = true
+		}
+	}
+	// A default_port outside allowed_ports is silently unusable: every CONNECT
+	// without an explicit port would be rejected with 403.
+	if !defaultAllowed {
+		return fmt.Errorf("invalid config: default_port %d must appear in allowed_ports", c.DefaultPort)
 	}
 	u := c.Upstream
 	switch u.Protocol {
@@ -155,6 +161,9 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(u.Host) == "" || u.Port <= 0 || u.Port > 65535 {
 		return fmt.Errorf("invalid config: upstream host and port are required")
+	}
+	if strings.ContainsAny(u.Host, " /@?#[]") {
+		return fmt.Errorf("invalid config: upstream host must be a bare hostname or IP")
 	}
 	if u.UsernameEnv != "" && os.Getenv(u.UsernameEnv) == "" {
 		return fmt.Errorf("invalid config: upstream username env %q is missing or empty", u.UsernameEnv)

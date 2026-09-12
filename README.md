@@ -3,6 +3,12 @@
 Private CONNECT egress gateway: many PCs -> gateway -> third-party proxy -> destination.
 TLS content stays end-to-end. Single upstream. Fail-closed. Local MVP only.
 
+## Project status
+
+The repository default branch is `main`. The current implementation is the
+local MVP; VPS and third-party proxy deployment remain deferred until the M1
+acceptance gate is complete.
+
 Out of scope: User-Agent editing, TLS interception, provider API translation,
 prompt/token accounting, whole-PC proxying, proxy rotation, DB, production deploy.
 

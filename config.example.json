@@ -1,0 +1,29 @@
+{
+  "listen_addr": "127.0.0.1:8080",
+  "clients": [
+    {"id": "pc-01", "secret_env": "GATEWAY_CLIENT_PC_01_SECRET"},
+    {"id": "pc-02", "secret_env": "GATEWAY_CLIENT_PC_02_SECRET"}
+  ],
+  "allowlist": ["example.com", "api.example.com"],
+  "allowed_ports": [443],
+  "default_port": 443,
+  "upstream": {
+    "protocol": "http",
+    "host": "127.0.0.1",
+    "port": 3128,
+    "username_env": "GATEWAY_UPSTREAM_USER",
+    "password_env": "GATEWAY_UPSTREAM_PASS"
+  },
+  "limits": {
+    "max_active": 64,
+    "max_pending_per_client": 8,
+    "max_new_per_second": 20,
+    "max_buffer_bytes": 32768
+  },
+  "timeouts": {
+    "read_header_ms": 5000,
+    "dial_ms": 8000,
+    "handshake_ms": 8000,
+    "tunnel_idle_ms": 60000
+  }
+}

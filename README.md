@@ -29,7 +29,9 @@ bad listener, missing client/env secret, duplicate client, empty allowlist,
 unsupported upstream protocol, bad limits/timeouts, unreadable CA file,
 `default_port` missing from `allowed_ports` (every portless CONNECT would 403),
 an `upstream.host` or allowlist entry that is not a bare hostname or IP (no
-brackets, no port), and a negative `max_pending_handshakes`.
+brackets, no port), a client id outside `[A-Za-z0-9._-]{1,64}` (it is echoed to
+the log, so it must not be able to forge a log line), and a
+`max_pending_handshakes` that is negative or above 65536.
 
 ## Client use
 
@@ -70,7 +72,10 @@ rejected; 502/504 means upstream failed; 429/503 means limits; check redacted
 gateway logs without secrets.
 6. `max_pending_handshakes` caps connections accepted but not yet tunnelling, so
 unauthenticated peers cannot each pin a header buffer; it defaults to
-`4 * max_active` and answers 503 once full.
+`4 * max_active`, is capped at 65536, and answers 503 once full. Note this cap
+applies *after* the TCP accept: bounding connections before that needs listener
+backlog or firewall rate limiting, which is an M2 deployment task, not a code
+change.
 7. Stop with SIGINT/SIGTERM; the server stops accepting, waits out live tunnels,
 then cancels in-flight DNS and upstream dials and force-closes both legs of
 whatever is left, so shutdown cannot hang on an idle tunnel or a silent upstream.

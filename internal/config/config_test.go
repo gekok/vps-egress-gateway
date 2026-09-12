@@ -164,3 +164,50 @@ func TestMaxPendingHandshakesDefault(t *testing.T) {
 		t.Fatalf("expected rejection of a negative max_pending_handshakes")
 	}
 }
+
+// A client id is echoed into the gateway log on every tunnel, so it must not be
+// able to forge a log line or carry terminal escapes.
+func TestRejectsClientIDWithControlChars(t *testing.T) {
+	bad := map[string]string{
+		"newline": "pc-01\\n2026/01/01 [gateway] client=admin host=evil.com tunnel open",
+		"cr":      "pc\\r01",
+		"tab":     "pc\\t01",
+		"space":   "pc 01",
+		"escape":  "pc\\u001b[31m01",
+		"slash":   "pc/01",
+	}
+	for name, id := range bad {
+		cfg := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "` + id + `", "secret_env": "S"}], "allowlist": ["example.com"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+		p := writeTempConfig(t, cfg, map[string]string{"S": "x"})
+		if _, err := Load(p); err == nil {
+			t.Errorf("%s: expected rejection of client id %q", name, id)
+		}
+	}
+	for _, id := range []string{"pc-01", "pc_01.a", "PC01", "a"} {
+		cfg := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "` + id + `", "secret_env": "S"}], "allowlist": ["example.com"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+		p := writeTempConfig(t, cfg, map[string]string{"S": "x"})
+		if _, err := Load(p); err != nil {
+			t.Errorf("valid client id %q rejected: %v", id, err)
+		}
+	}
+}
+
+func TestRejectsOversizedPendingCap(t *testing.T) {
+	for _, v := range []string{"1048576", "2147483647"} {
+		cfg := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1, "max_pending_handshakes": ` + v + `}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+		p := writeTempConfig(t, cfg, map[string]string{"S": "x"})
+		if _, err := Load(p); err == nil {
+			t.Errorf("expected rejection of max_pending_handshakes=%s", v)
+		}
+	}
+	// The derived default must stay inside the bound too.
+	cfg := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 60000, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	p := writeTempConfig(t, cfg, map[string]string{"S": "x"})
+	loaded, err := Load(p)
+	if err != nil {
+		t.Fatalf("large max_active rejected: %v", err)
+	}
+	if loaded.Limits.MaxPendingHandshakes > MaxPendingHandshakesLimit {
+		t.Fatalf("derived default %d exceeds the bound %d", loaded.Limits.MaxPendingHandshakes, MaxPendingHandshakesLimit)
+	}
+}

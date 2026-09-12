@@ -30,7 +30,11 @@ Rules:
   force-closing, in-flight DNS and dials are cancelled and no new conn is
   tracked, so no handler can outlive the drain window.
 - Connections accepted but not yet relaying are capped by
-  limits.max_pending_handshakes.
+  limits.max_pending_handshakes, which is bounded so it cannot be set so high
+  that it stops being a cap. The cap applies after accept; pre-accept limiting
+  is an infrastructure concern for M2.
+- A client id must be [A-Za-z0-9._-]{1,64}: it is written to the gateway log
+  verbatim, so it must not be able to forge a log line or carry escapes.
 - Request line and header reads are byte-capped, so a peer that never sends a
   newline cannot grow a buffer without bound.
 - TLS content stays opaque; gateway never terminates client TLS.

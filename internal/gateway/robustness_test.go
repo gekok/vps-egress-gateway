@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -477,5 +478,79 @@ func TestDuplicateProxyAuthorizationRejected(t *testing.T) {
 	}
 	if !strings.Contains(status, "400") {
 		t.Fatalf("status = %q, want 400 for a duplicated Proxy-Authorization", status)
+	}
+}
+
+// TestRepeatedShutdownDoesNotLeak starts and stops the server many times and
+// checks that goroutines wind down each round.
+func TestRepeatedShutdownDoesNotLeak(t *testing.T) {
+	echo := testutil.StartEchoServer(t, "marker-A")
+	fwd := testutil.StartFakeHTTPUpstream(t, "ok", echo, "", "")
+
+	settle := func() int {
+		var n int
+		for i := 0; i < 50; i++ {
+			runtime.GC()
+			n = runtime.NumGoroutine()
+			time.Sleep(20 * time.Millisecond)
+			if runtime.NumGoroutine() <= n {
+				break
+			}
+		}
+		return runtime.NumGoroutine()
+	}
+
+	cfg, fr := testServerConfig(t, fwd.Addr)
+	// One warm-up round so lazily created goroutines are not counted as a leak.
+	runRound(t, cfg, fr)
+	before := settle()
+
+	const rounds = 15
+	for i := 0; i < rounds; i++ {
+		runRound(t, cfg, fr)
+	}
+	after := settle()
+
+	if after > before+5 {
+		t.Fatalf("goroutines grew from %d to %d over %d shutdown rounds", before, after, rounds)
+	}
+}
+
+// runRound brings a server up, pushes one tunnel through it, and shuts it down.
+func runRound(t *testing.T, cfg *config.Config, fr *testutil.FakeResolver) {
+	t.Helper()
+	s, err := NewWithDeps(cfg, access.NewPolicy(cfg, fr), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.DrainGrace = 50 * time.Millisecond
+	s.DrainHard = 2 * time.Second
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.ServeListener(ln) }()
+
+	c, err := net.DialTimeout("tcp", ln.Addr().String(), 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	io.WriteString(c, "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: "+basicAuth("pc-01", "secret-a")+"\r\n\r\n")
+	br := bufio.NewReader(c)
+	if _, err := br.ReadString('\n'); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	c.Close()
+
+	s.Shutdown()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("shutdown returned %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ServeListener did not return")
 	}
 }

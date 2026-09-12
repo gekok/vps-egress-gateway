@@ -177,6 +177,9 @@ func (s *Server) ServeListener(ln net.Listener) error {
 	s.ln = ln
 	s.lnMu.Unlock()
 	defer ln.Close()
+	// Release forceCtx even when the drain finishes inside its grace period and
+	// never reaches the force-close branch.
+	defer s.forceCancel()
 	// Shutdown may have run before the listener was registered, in which case it
 	// found a nil listener and could not close it.
 	select {

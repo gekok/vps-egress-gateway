@@ -8,6 +8,9 @@ import (
 	"strings"
 )
 
+// MaxPendingHandshakesLimit bounds limits.max_pending_handshakes.
+const MaxPendingHandshakesLimit = 65536
+
 const (
 	ProtocolHTTP   = "http"
 	ProtocolHTTPS  = "https"
@@ -116,6 +119,11 @@ func (c *Config) Validate() error {
 		if cl.ID == "" || cl.SecretEnv == "" {
 			return fmt.Errorf("invalid config: client id and secret_env are required")
 		}
+		// The client id reaches the gateway log on every tunnel, so keep it to
+		// characters that cannot forge a log line or smuggle terminal escapes.
+		if !isPlainID(cl.ID) {
+			return fmt.Errorf("invalid config: client id %q must be 1-64 chars of A-Z a-z 0-9 . _ -", cl.ID)
+		}
 		if _, ok := seen[cl.ID]; ok {
 			return fmt.Errorf("invalid config: duplicate client id")
 		}
@@ -189,13 +197,38 @@ func (c *Config) Validate() error {
 	if c.Limits.MaxPendingHandshakes < 0 {
 		return fmt.Errorf("invalid config: max_pending_handshakes must not be negative")
 	}
+	// An unbounded value defeats the cap it exists to provide: every pending
+	// slot is a goroutine holding a socket and a header buffer.
+	if c.Limits.MaxPendingHandshakes > MaxPendingHandshakesLimit {
+		return fmt.Errorf("invalid config: max_pending_handshakes must not exceed %d", MaxPendingHandshakesLimit)
+	}
 	if c.Limits.MaxPendingHandshakes == 0 {
 		c.Limits.MaxPendingHandshakes = 4 * c.Limits.MaxActive
+		if c.Limits.MaxPendingHandshakes > MaxPendingHandshakesLimit {
+			c.Limits.MaxPendingHandshakes = MaxPendingHandshakesLimit
+		}
 	}
 	if c.Timeouts.ReadHeaderMs <= 0 || c.Timeouts.DialMs <= 0 || c.Timeouts.HandshakeMs <= 0 || c.Timeouts.TunnelIdleMs <= 0 {
 		return fmt.Errorf("invalid config: timeouts must be positive milliseconds")
 	}
 	return nil
+}
+
+// isPlainID reports whether s is safe to embed in a log line verbatim.
+func isPlainID(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '.', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func isLoopbackHost(h string) bool {

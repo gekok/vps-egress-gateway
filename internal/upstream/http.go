@@ -32,7 +32,7 @@ func (d *httpDialer) Dial(ctx context.Context, target access.Target) (net.Conn, 
 	defer cancel()
 	conn, err := d.dial(ctx, "tcp", d.upstreamAddr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("dial upstream")
+		return nil, nil, fmt.Errorf("dial upstream %s: %w", d.upstreamAddr, err)
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
@@ -49,7 +49,7 @@ func (d *httpDialer) Dial(ctx context.Context, target access.Target) (net.Conn, 
 	sb.WriteString("Proxy-Connection: Keep-Alive\r\n\r\n")
 	if _, err := io.WriteString(conn, sb.String()); err != nil {
 		conn.Close()
-		return nil, nil, fmt.Errorf("write connect")
+		return nil, nil, fmt.Errorf("write connect to upstream: %w", err)
 	}
 	br := bufio.NewReaderSize(conn, 8192)
 	code, err := readConnectStatus(br, maxUpstreamHeaderBytes)
@@ -60,7 +60,7 @@ func (d *httpDialer) Dial(ctx context.Context, target access.Target) (net.Conn, 
 	}
 	if code != 200 {
 		conn.Close()
-		return nil, nil, fmt.Errorf("upstream rejected")
+		return nil, nil, fmt.Errorf("upstream rejected CONNECT with status %d", code)
 	}
 	// Bytes the upstream packed into the same read as the CONNECT response are
 	// early tunnel data. Hand them back exactly once and drain them from the
@@ -104,7 +104,7 @@ func readConnectStatus(br *bufio.Reader, maxHeader int) (int, error) {
 	for {
 		line, err := readLineLimited(br, maxHeader)
 		if err != nil {
-			return 0, fmt.Errorf("read upstream response")
+			return 0, fmt.Errorf("read upstream CONNECT response: %w", err)
 		}
 		total += len(line)
 		if total > maxHeader {

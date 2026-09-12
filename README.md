@@ -28,7 +28,8 @@ Default listen is loopback only (`127.0.0.1:8080`). Config fails startup on:
 bad listener, missing client/env secret, duplicate client, empty allowlist,
 unsupported upstream protocol, bad limits/timeouts, unreadable CA file,
 `default_port` missing from `allowed_ports` (every portless CONNECT would 403),
-and an `upstream.host` that is not a bare hostname or IP.
+an `upstream.host` or allowlist entry that is not a bare hostname or IP (no
+brackets, no port), and a negative `max_pending_handshakes`.
 
 ## Client use
 
@@ -67,9 +68,12 @@ No provider key or Internet required.
 5. Troubleshoot: 407 means client auth failed; 403 means host/port/DNS policy
 rejected; 502/504 means upstream failed; 429/503 means limits; check redacted
 gateway logs without secrets.
-6. Stop with SIGINT/SIGTERM; the server stops accepting, waits out live tunnels,
-then force-closes both legs of whatever is left so shutdown cannot hang on an
-idle tunnel or a silent upstream.
+6. `max_pending_handshakes` caps connections accepted but not yet tunnelling, so
+unauthenticated peers cannot each pin a header buffer; it defaults to
+`4 * max_active` and answers 503 once full.
+7. Stop with SIGINT/SIGTERM; the server stops accepting, waits out live tunnels,
+then cancels in-flight DNS and upstream dials and force-closes both legs of
+whatever is left, so shutdown cannot hang on an idle tunnel or a silent upstream.
 
 Local success does not prove Internet IP masking. Multi-PC Internet
 verification is deferred to M2 after M1 acceptance and infra decisions.

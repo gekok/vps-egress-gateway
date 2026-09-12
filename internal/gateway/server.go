@@ -46,9 +46,19 @@ type Server struct {
 	DrainGrace time.Duration
 	DrainHard  time.Duration
 
-	mu     sync.Mutex
-	active map[net.Conn]struct{}
-	wg     sync.WaitGroup
+	mu       sync.Mutex
+	active   map[net.Conn]struct{}
+	draining bool
+	wg       sync.WaitGroup
+
+	// pending bounds connections accepted but not yet relaying, so
+	// unauthenticated peers cannot each pin a header buffer.
+	pending chan struct{}
+
+	// forceCtx is cancelled when drain() starts force-closing, so a handler
+	// parked in DNS or an upstream dial gives up instead of outliving DrainHard.
+	forceCtx    context.Context
+	forceCancel context.CancelFunc
 
 	quitOnce sync.Once
 	quit     chan struct{}
@@ -75,6 +85,14 @@ func NewWithDeps(cfg *config.Config, policy *access.Policy, d upstream.Dialer) (
 	if buf <= 0 {
 		buf = 32 * 1024
 	}
+	pendingSlots := cfg.Limits.MaxPendingHandshakes
+	if pendingSlots <= 0 {
+		pendingSlots = 4 * cfg.Limits.MaxActive
+	}
+	if pendingSlots <= 0 {
+		pendingSlots = 64
+	}
+	forceCtx, forceCancel := context.WithCancel(context.Background())
 	return &Server{
 		cfg:         cfg,
 		policy:      policy,
@@ -87,6 +105,9 @@ func NewWithDeps(cfg *config.Config, policy *access.Policy, d upstream.Dialer) (
 		DrainGrace:  defaultDrainGrace,
 		DrainHard:   defaultDrainHard,
 		active:      make(map[net.Conn]struct{}),
+		pending:     make(chan struct{}, pendingSlots),
+		forceCtx:    forceCtx,
+		forceCancel: forceCancel,
 		quit:        make(chan struct{}),
 	}, nil
 }
@@ -115,10 +136,20 @@ func (s *Server) Shutdown() {
 	}
 }
 
-func (s *Server) track(c net.Conn) {
+// track registers a conn for force-close. It reports false once drain has begun,
+// in which case the conn is closed straight away and the caller must give up:
+// otherwise a conn created during the force-close pass would never be closed.
+func (s *Server) track(c net.Conn) bool {
 	s.mu.Lock()
+	if s.draining {
+		s.mu.Unlock()
+		_ = c.SetDeadline(time.Now())
+		_ = c.Close()
+		return false
+	}
 	s.active[c] = struct{}{}
 	s.mu.Unlock()
+	return true
 }
 
 func (s *Server) untrack(c net.Conn) {
@@ -129,6 +160,7 @@ func (s *Server) untrack(c net.Conn) {
 
 func (s *Server) closeAllTracked() {
 	s.mu.Lock()
+	s.draining = true
 	conns := make([]net.Conn, 0, len(s.active))
 	for c := range s.active {
 		conns = append(conns, c)
@@ -164,17 +196,40 @@ func (s *Server) ServeListener(ln net.Listener) error {
 		case <-s.quit:
 		}
 	}()
+	var acceptDelay time.Duration
+acceptLoop:
 	for {
 		c, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				break acceptLoop
+			}
 			select {
 			case <-s.quit:
+				break acceptLoop
 			default:
-				log.Printf("[gateway] accept ended: %v", err)
 			}
-			break
+			// A transient accept error (fd exhaustion, a peer that reset before
+			// we accepted it) must not take the listener down for good.
+			if acceptDelay == 0 {
+				acceptDelay = 5 * time.Millisecond
+			} else if acceptDelay *= 2; acceptDelay > time.Second {
+				acceptDelay = time.Second
+			}
+			log.Printf("[gateway] accept error, retrying in %v: %v", acceptDelay, err)
+			t := time.NewTimer(acceptDelay)
+			select {
+			case <-t.C:
+			case <-s.quit:
+				t.Stop()
+				break acceptLoop
+			}
+			continue
 		}
-		s.track(c)
+		acceptDelay = 0
+		if !s.track(c) {
+			continue
+		}
 		s.wg.Add(1)
 		go func(conn net.Conn) {
 			defer s.wg.Done()
@@ -201,6 +256,7 @@ func (s *Server) drain() error {
 	case <-time.After(s.DrainGrace):
 	}
 	log.Printf("[gateway] force-close remaining")
+	s.forceCancel()
 	s.closeAllTracked()
 	select {
 	case <-done:
@@ -246,6 +302,18 @@ func readLineLimited(br *bufio.Reader, max int) (string, error) {
 }
 
 func (s *Server) handleConn(raw net.Conn) {
+	// Hold a pending slot until this connection either fails or becomes a
+	// tunnel. Past that point max_active governs.
+	select {
+	case s.pending <- struct{}{}:
+	default:
+		writeStatus(raw, 503, "Overloaded", nil)
+		return
+	}
+	var releaseOnce sync.Once
+	releasePending := func() { releaseOnce.Do(func() { <-s.pending }) }
+	defer releasePending()
+
 	_ = raw.SetDeadline(time.Now().Add(s.readHeader))
 	br := bufio.NewReaderSize(raw, 8192)
 	reqLine, err := readLineLimited(br, maxRequestLineBytes)
@@ -291,6 +359,12 @@ func (s *Server) handleConn(raw net.Conn) {
 		name := strings.TrimSpace(line[:idx])
 		val := strings.TrimSpace(line[idx+1:])
 		if strings.EqualFold(name, "Proxy-Authorization") {
+			// Two credentials in one request is ambiguous; refuse rather than
+			// silently picking the last one.
+			if proxyAuth != "" {
+				writeStatus(raw, 400, "Bad Request", nil)
+				return
+			}
 			proxyAuth = val
 		}
 	}
@@ -299,7 +373,7 @@ func (s *Server) handleConn(raw net.Conn) {
 		writeStatus(raw, 407, "Proxy Auth Required", map[string]string{"Proxy-Authenticate": "Basic realm=\"gateway\""})
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), s.dialTimeout)
+	ctx, cancel := context.WithTimeout(s.forceCtx, s.dialTimeout)
 	target, err := s.policy.AuthorizeTarget(ctx, authority)
 	cancel()
 	if err != nil {
@@ -315,17 +389,20 @@ func (s *Server) handleConn(raw net.Conn) {
 		return
 	}
 	defer s.lim.release(auth.ClientID)
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), s.dialTimeout+time.Duration(s.cfg.Timeouts.HandshakeMs)*time.Millisecond)
+	dialCtx, dialCancel := context.WithTimeout(s.forceCtx, s.dialTimeout+time.Duration(s.cfg.Timeouts.HandshakeMs)*time.Millisecond)
 	defer dialCancel()
 	up, upBuffered, err := s.dialer.Dial(dialCtx, target)
 	if err != nil {
 		writeStatus(raw, 502, "Bad Gateway", nil)
-		log.Printf("[gateway] client=%s host=%s dial failed", auth.ClientID, target.Hostname)
+		// The cause stays in the gateway log; the client only ever sees 502.
+		log.Printf("[gateway] client=%s host=%s dial failed: %v", auth.ClientID, target.Hostname, err)
 		return
 	}
 	// Tracked so shutdown can force-close the upstream leg too; otherwise the
 	// upstream-to-client copy keeps blocking until tunnel_idle_ms expires.
-	s.track(up)
+	if !s.track(up) {
+		return
+	}
 	defer func() {
 		up.Close()
 		s.untrack(up)
@@ -355,6 +432,7 @@ func (s *Server) handleConn(raw net.Conn) {
 		}
 	}
 	log.Printf("[gateway] client=%s host=%s tunnel open", auth.ClientID, target.Hostname)
+	releasePending()
 	c2u, u2c := relayTunnel(raw, up, s.idleTimeout, s.relayBuf)
 	log.Printf("[gateway] client=%s host=%s tunnel close c2u=%d u2c=%d", auth.ClientID, target.Hostname, c2u, u2c)
 }

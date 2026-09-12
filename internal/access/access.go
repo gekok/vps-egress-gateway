@@ -247,9 +247,12 @@ var reservedNets = mustParseCIDRs(
 	"64:ff9b::/96",    // NAT64 well-known prefix
 	"64:ff9b:1::/48",  // NAT64 local-use prefix
 	"100::/64",        // discard-only
-	"2001::/32",       // Teredo
-	"2001:db8::/32",   // documentation
-	"2002::/16",       // 6to4 (deprecated)
+	// 2001::/23 is the IETF protocol assignments block: Teredo (2001::/32),
+	// benchmarking (2001:2::/48), ORCHID (2001:10::/28) and ORCHIDv2
+	// (2001:20::/28) all sit inside it, and so will future assignments.
+	"2001::/23",
+	"2001:db8::/32", // documentation
+	"2002::/16",     // 6to4 (deprecated)
 )
 
 func mustParseCIDRs(cidrs ...string) []*net.IPNet {

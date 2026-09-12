@@ -131,3 +131,36 @@ func TestExampleConfigValidates(t *testing.T) {
 		t.Fatalf("config.example.json does not validate: %v", err)
 	}
 }
+
+// A bracketed allowlist entry used to validate but could never match at
+// runtime, because the policy stores the entry verbatim while ParseAuthority
+// strips the brackets off the request.
+func TestRejectsBracketedAllowlistEntry(t *testing.T) {
+	bad := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["[2606:4700:4700::1111]"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	p := writeTempConfig(t, bad, map[string]string{"S": "x"})
+	if _, err := Load(p); err == nil {
+		t.Fatalf("expected rejection: a bracketed entry can never match a request")
+	}
+
+	good := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["2606:4700:4700::1111"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	p2 := writeTempConfig(t, good, map[string]string{"S": "x"})
+	if _, err := Load(p2); err != nil {
+		t.Fatalf("bare IPv6 allowlist entry rejected: %v", err)
+	}
+}
+
+func TestMaxPendingHandshakesDefault(t *testing.T) {
+	p := writeTempConfig(t, validCfg, map[string]string{"TEST_CLI_SECRET": "s3cret"})
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 4 * cfg.Limits.MaxActive; cfg.Limits.MaxPendingHandshakes != want {
+		t.Fatalf("max_pending_handshakes = %d, want default %d", cfg.Limits.MaxPendingHandshakes, want)
+	}
+	bad := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 1, "max_pending_per_client": 1, "max_new_per_second": 1, "max_pending_handshakes": -1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	p2 := writeTempConfig(t, bad, map[string]string{"S": "x"})
+	if _, err := Load(p2); err == nil {
+		t.Fatalf("expected rejection of a negative max_pending_handshakes")
+	}
+}

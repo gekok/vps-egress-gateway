@@ -34,6 +34,10 @@ type Limits struct {
 	MaxPendingPerClient int `json:"max_pending_per_client"`
 	MaxNewPerSecond     int `json:"max_new_per_second"`
 	MaxBufferBytes      int `json:"max_buffer_bytes"`
+	// MaxPendingHandshakes caps connections that have been accepted but have
+	// not reached a tunnel yet, so unauthenticated peers cannot pin one header
+	// buffer each. Defaults to 4x MaxActive.
+	MaxPendingHandshakes int `json:"max_pending_handshakes,omitempty"`
 }
 
 type Timeouts struct {
@@ -124,13 +128,13 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid config: allowlist must not be empty")
 	}
 	for _, h := range c.Allowlist {
-		if strings.TrimSpace(h) == "" || strings.ContainsAny(h, " /@?#") {
-			return fmt.Errorf("invalid config: bad allowlist entry")
+		if strings.TrimSpace(h) == "" || strings.ContainsAny(h, " /@?#[]") {
+			return fmt.Errorf("invalid config: allowlist entry %q must be a bare hostname or IP, with no brackets", h)
 		}
 		// A colon is only legal in an IPv6 literal; anywhere else it means the
 		// entry carries a port or scheme, which the allowlist must not.
-		if strings.Contains(h, ":") && net.ParseIP(strings.Trim(h, "[]")) == nil {
-			return fmt.Errorf("invalid config: bad allowlist entry")
+		if strings.Contains(h, ":") && net.ParseIP(h) == nil {
+			return fmt.Errorf("invalid config: bad allowlist entry %q", h)
 		}
 	}
 	if c.DefaultPort == 0 {
@@ -181,6 +185,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Limits.MaxBufferBytes <= 0 {
 		c.Limits.MaxBufferBytes = 32 * 1024
+	}
+	if c.Limits.MaxPendingHandshakes < 0 {
+		return fmt.Errorf("invalid config: max_pending_handshakes must not be negative")
+	}
+	if c.Limits.MaxPendingHandshakes == 0 {
+		c.Limits.MaxPendingHandshakes = 4 * c.Limits.MaxActive
 	}
 	if c.Timeouts.ReadHeaderMs <= 0 || c.Timeouts.DialMs <= 0 || c.Timeouts.HandshakeMs <= 0 || c.Timeouts.TunnelIdleMs <= 0 {
 		return fmt.Errorf("invalid config: timeouts must be positive milliseconds")

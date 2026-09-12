@@ -18,7 +18,8 @@
     "max_active": 64,
     "max_pending_per_client": 8,
     "max_new_per_second": 20,
-    "max_buffer_bytes": 32768
+    "max_buffer_bytes": 32768,
+    "max_pending_handshakes": 256
   },
   "timeouts": {
     "read_header_ms": 5000,

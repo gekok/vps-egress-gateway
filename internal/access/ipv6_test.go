@@ -119,6 +119,9 @@ func TestReservedRangesFailClosed(t *testing.T) {
 		"::a00:1":         "IPv4-compatible embedding 10.0.0.1",
 		"::ffff:0:a00:1":  "IPv4-translated embedding 10.0.0.1",
 		"2001::1":         "Teredo",
+		"2001:2::1":       "benchmarking 2001:2::/48",
+		"2001:10::1":      "ORCHID 2001:10::/28",
+		"2001:20::1":      "ORCHIDv2 2001:20::/28",
 		"100::1":          "discard-only",
 	}
 	for s, note := range blocked {
@@ -152,5 +155,25 @@ func TestReservedDNSAnswerFailsClosed(t *testing.T) {
 		if _, err := p.AuthorizeTarget(context.Background(), "example.com:443"); err == nil {
 			t.Errorf("DNS answer %s was accepted", bad)
 		}
+	}
+}
+
+// TestBracketedAllowlistEntryNeverMatches documents why config rejects the
+// bracketed form: the policy stores entries verbatim, while ParseAuthority
+// hands back an unbracketed host, so the two could never meet.
+func TestBracketedAllowlistEntryNeverMatches(t *testing.T) {
+	cfg := &config.Config{
+		Allowlist:    []string{"[2606:4700:4700::1111]"},
+		AllowedPorts: []int{443},
+		DefaultPort:  443,
+	}
+	p := NewPolicy(cfg, &fakeResolver{})
+	if _, err := p.AuthorizeTarget(context.Background(), "[2606:4700:4700::1111]:443"); err == nil {
+		t.Fatal("bracketed entry matched; config must keep rejecting this form")
+	}
+	cfg.Allowlist = []string{"2606:4700:4700::1111"}
+	p = NewPolicy(cfg, &fakeResolver{})
+	if _, err := p.AuthorizeTarget(context.Background(), "[2606:4700:4700::1111]:443"); err != nil {
+		t.Fatalf("bare entry should match a bracketed request: %v", err)
 	}
 }

@@ -2,9 +2,11 @@ package gateway
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -337,5 +339,143 @@ func TestClientEarlyDataForwardedOnce(t *testing.T) {
 	got := sb.String()
 	if n := strings.Count(got, "EARLY-PAYLOAD"); n != 1 {
 		t.Fatalf("payload echoed %d times, want exactly 1: %q", n, got)
+	}
+}
+
+// ctxAwareDialer holds the dial until release is closed, but gives up as soon as
+// the context is cancelled, the way every real dialer behaves.
+type ctxAwareDialer struct {
+	started chan struct{}
+	release chan struct{}
+	target  string
+	once    sync.Once
+}
+
+func (d *ctxAwareDialer) Dial(ctx context.Context, _ access.Target) (net.Conn, []byte, error) {
+	d.once.Do(func() { close(d.started) })
+	select {
+	case <-d.release:
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+	c, err := net.Dial("tcp", d.target)
+	return c, nil, err
+}
+
+// TestShutdownDuringUpstreamDial covers a SIGTERM that lands while a handler is
+// still dialling: the dial has to be cancelled, otherwise the handler outlives
+// DrainHard and shutdown reports a spurious failure.
+func TestShutdownDuringUpstreamDial(t *testing.T) {
+	echo := testutil.StartEchoServer(t, "MARK")
+	cfg, fr := testServerConfig(t, "127.0.0.1:1")
+	cfg.Timeouts.TunnelIdleMs = 60000
+	d := &ctxAwareDialer{started: make(chan struct{}), release: make(chan struct{}), target: echo}
+	s, err := NewWithDeps(cfg, access.NewPolicy(cfg, fr), d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.DrainGrace = 100 * time.Millisecond
+	s.DrainHard = 500 * time.Millisecond
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer close(d.release)
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.ServeListener(ln) }()
+	time.Sleep(80 * time.Millisecond)
+
+	c, err := net.DialTimeout("tcp", ln.Addr().String(), 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial gateway: %v", err)
+	}
+	defer c.Close()
+	io.WriteString(c, "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: "+basicAuth("pc-01", "secret-a")+"\r\n\r\n")
+	select {
+	case <-d.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream dial never started")
+	}
+
+	start := time.Now()
+	s.Shutdown()
+	select {
+	case err := <-errCh:
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("shutdown returned %v after %v; the in-flight dial was not cancelled", err, elapsed)
+		}
+		if elapsed > 2*time.Second {
+			t.Fatalf("shutdown took %v with a dial in flight", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ServeListener hung on an in-flight dial")
+	}
+}
+
+// TestPendingHandshakesAreCapped checks that connections which never finish a
+// handshake cannot pin a header buffer each.
+func TestPendingHandshakesAreCapped(t *testing.T) {
+	fwd := testutil.StartFakeHTTPUpstream(t, "ok", testutil.StartEchoServer(t, "marker-A"), "", "")
+	cfg, fr := testServerConfig(t, fwd.Addr)
+	cfg.Limits.MaxPendingHandshakes = 3
+	gw := startServer(t, cfg, fr)
+
+	// Occupy every pending slot with peers that connect and then say nothing.
+	var held []net.Conn
+	defer func() {
+		for _, c := range held {
+			c.Close()
+		}
+	}()
+	for i := 0; i < 3; i++ {
+		c, err := net.DialTimeout("tcp", gw, 3*time.Second)
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		held = append(held, c)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	c, err := net.DialTimeout("tcp", gw, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial overflow: %v", err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(3 * time.Second))
+	io.WriteString(c, "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: "+basicAuth("pc-01", "secret-a")+"\r\n\r\n")
+	br := bufio.NewReader(c)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if !strings.Contains(status, "503") {
+		t.Fatalf("status = %q, want 503 once the pending cap is reached", status)
+	}
+}
+
+// TestDuplicateProxyAuthorizationRejected: two credentials in one request is
+// ambiguous, so it must be refused rather than last-one-wins.
+func TestDuplicateProxyAuthorizationRejected(t *testing.T) {
+	fwd := testutil.StartFakeHTTPUpstream(t, "ok", testutil.StartEchoServer(t, "marker-A"), "", "")
+	cfg, fr := testServerConfig(t, fwd.Addr)
+	gw := startServer(t, cfg, fr)
+
+	c, err := net.DialTimeout("tcp", gw, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial gateway: %v", err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	io.WriteString(c, "CONNECT example.com:443 HTTP/1.1\r\n"+
+		"Proxy-Authorization: "+basicAuth("pc-01", "wrong")+"\r\n"+
+		"Proxy-Authorization: "+basicAuth("pc-01", "secret-a")+"\r\n\r\n")
+	br := bufio.NewReader(c)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if !strings.Contains(status, "400") {
+		t.Fatalf("status = %q, want 400 for a duplicated Proxy-Authorization", status)
 	}
 }

@@ -26,7 +26,11 @@ Rules:
 - Early bytes the upstream packs in with its CONNECT response are handed to the
   caller exactly once; the tunnel must never replay them.
 - Every upstream handshake runs under a deadline, and every conn (client and
-  upstream leg) is tracked so shutdown can force-close it.
+  upstream leg) is tracked so shutdown can force-close it. Once drain starts
+  force-closing, in-flight DNS and dials are cancelled and no new conn is
+  tracked, so no handler can outlive the drain window.
+- Connections accepted but not yet relaying are capped by
+  limits.max_pending_handshakes.
 - Request line and header reads are byte-capped, so a peer that never sends a
   newline cannot grow a buffer without bound.
 - TLS content stays opaque; gateway never terminates client TLS.

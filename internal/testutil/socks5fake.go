@@ -2,7 +2,6 @@ package testutil
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -25,16 +24,7 @@ func StartFakeSOCKS5(t *testing.T, username, password, targetAddr string) *FakeS
 		t.Fatalf("listen socks5: %v", err)
 	}
 	f := &FakeSOCKS5{Listener: ln, Addr: ln.Addr().String(), Username: username, Password: password, TargetAddr: targetAddr}
-	t.Cleanup(func() { ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go f.handle(c)
-		}
-	}()
+	Serve(t, ln, f.handle)
 	return f
 }
 
@@ -150,5 +140,3 @@ func (f *FakeSOCKS5) handle(conn net.Conn) {
 	conn.SetDeadline(time.Time{})
 	relay(conn, target)
 }
-
-var _ = fmt.Sprint

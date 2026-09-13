@@ -60,9 +60,8 @@ func NewPolicy(cfg *config.Config, resolver Resolver) *Policy {
 }
 
 func NormalizeHost(h string) string {
-	h = strings.TrimSpace(h)
-	h = strings.TrimSuffix(h, ".")
-	return strings.ToLower(h)
+	host, _ := config.CanonicalHost(h)
+	return host
 }
 
 type AuthResult struct {
@@ -108,7 +107,7 @@ type Target struct {
 }
 
 func ParseAuthority(authority string, defaultPort int, allowedPorts map[int]struct{}) (string, int, error) {
-	if authority == "" {
+	if authority == "" || strings.TrimSpace(authority) != authority {
 		return "", 0, fmt.Errorf("empty authority")
 	}
 	if strings.Contains(authority, "@") || strings.Contains(authority, "/") || strings.Contains(authority, "?") || strings.Contains(authority, "#") {
@@ -123,10 +122,19 @@ func ParseAuthority(authority string, defaultPort int, allowedPorts map[int]stru
 	if err != nil {
 		hostname = authority
 		port = defaultPort
+		if strings.HasPrefix(authority, "[") && strings.HasSuffix(authority, "]") {
+			hostname = authority[1 : len(authority)-1]
+			if ip := net.ParseIP(hostname); ip == nil || !strings.Contains(hostname, ":") {
+				return "", 0, fmt.Errorf("invalid bracketed IP")
+			}
+		}
 	} else {
 		hostname = host
-		if portStr == "" {
-			port = defaultPort
+		if strings.HasPrefix(authority, "[") && (net.ParseIP(host) == nil || !strings.Contains(host, ":")) {
+			return "", 0, fmt.Errorf("invalid bracketed IP")
+		}
+		if portStr == "" || strings.IndexFunc(portStr, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+			return "", 0, fmt.Errorf("invalid port")
 		} else {
 			p, err := strconv.Atoi(portStr)
 			if err != nil {
@@ -135,16 +143,8 @@ func ParseAuthority(authority string, defaultPort int, allowedPorts map[int]stru
 			port = p
 		}
 	}
-	hostname = strings.TrimSpace(hostname)
-	hostname = strings.Trim(hostname, "[]")
-	if hostname == "" {
-		return "", 0, fmt.Errorf("empty host")
-	}
-	if ip := net.ParseIP(hostname); ip == nil {
-		hostname = NormalizeHost(hostname)
-		if strings.ContainsAny(hostname, " :/\\") || hostname == "" {
-			return "", 0, fmt.Errorf("invalid hostname")
-		}
+	if hostname, err = config.CanonicalHost(hostname); err != nil {
+		return "", 0, err
 	}
 	if port <= 0 || port > 65535 {
 		return "", 0, fmt.Errorf("invalid port")
@@ -189,7 +189,7 @@ func (p *Policy) AuthorizeTarget(ctx context.Context, authority string) (Target,
 	}
 	ips, err := p.Resolver.LookupIP(ctx, host)
 	if err != nil {
-		return Target{}, fmt.Errorf("dns resolution failed")
+		return Target{}, fmt.Errorf("dns resolution failed: %w", err)
 	}
 	if len(ips) == 0 {
 		return Target{}, fmt.Errorf("dns returned no addresses")

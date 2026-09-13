@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -71,6 +72,18 @@ func New(cfg *config.Config) (*Server, error) {
 }
 
 func NewWithDeps(cfg *config.Config, policy *access.Policy, d upstream.Dialer) (*Server, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("gateway config is required")
+	}
+	// Validate a snapshot: embedders must get the same checks as config.Load.
+	copyCfg := *cfg
+	copyCfg.Clients = slices.Clone(cfg.Clients)
+	copyCfg.Allowlist = slices.Clone(cfg.Allowlist)
+	copyCfg.AllowedPorts = slices.Clone(cfg.AllowedPorts)
+	cfg = &copyCfg
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	if policy == nil {
 		policy = access.NewPolicy(cfg, nil)
 	}
@@ -81,17 +94,6 @@ func NewWithDeps(cfg *config.Config, policy *access.Policy, d upstream.Dialer) (
 			return nil, err
 		}
 	}
-	buf := cfg.Limits.MaxBufferBytes
-	if buf <= 0 {
-		buf = 32 * 1024
-	}
-	pendingSlots := cfg.Limits.MaxPendingHandshakes
-	if pendingSlots <= 0 {
-		pendingSlots = 4 * cfg.Limits.MaxActive
-	}
-	if pendingSlots <= 0 {
-		pendingSlots = 64
-	}
 	forceCtx, forceCancel := context.WithCancel(context.Background())
 	return &Server{
 		cfg:         cfg,
@@ -101,11 +103,11 @@ func NewWithDeps(cfg *config.Config, policy *access.Policy, d upstream.Dialer) (
 		readHeader:  time.Duration(cfg.Timeouts.ReadHeaderMs) * time.Millisecond,
 		dialTimeout: time.Duration(cfg.Timeouts.DialMs) * time.Millisecond,
 		idleTimeout: time.Duration(cfg.Timeouts.TunnelIdleMs) * time.Millisecond,
-		relayBuf:    buf,
+		relayBuf:    cfg.Limits.MaxBufferBytes,
 		DrainGrace:  defaultDrainGrace,
 		DrainHard:   defaultDrainHard,
 		active:      make(map[net.Conn]struct{}),
-		pending:     make(chan struct{}, pendingSlots),
+		pending:     make(chan struct{}, cfg.Limits.MaxPendingHandshakes),
 		forceCtx:    forceCtx,
 		forceCancel: forceCancel,
 		quit:        make(chan struct{}),
@@ -117,8 +119,9 @@ func Serve(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
 	if err != nil {
+		s.forceCancel()
 		return fmt.Errorf("listen: %w", err)
 	}
 	return s.ServeListener(ln)
@@ -230,7 +233,17 @@ acceptLoop:
 			continue
 		}
 		acceptDelay = 0
+		// Reserve before starting a goroutine or registering the socket. Excess
+		// clients cannot create an unbounded population of rejecting handlers.
+		select {
+		case s.pending <- struct{}{}:
+		default:
+			writeStatusWithin(c, 503, "Overloaded", nil, 100*time.Millisecond)
+			c.Close()
+			continue
+		}
 		if !s.track(c) {
+			<-s.pending
 			continue
 		}
 		s.wg.Add(1)
@@ -272,13 +285,17 @@ func (s *Server) drain() error {
 }
 
 func writeStatus(c net.Conn, code int, reason string, extra map[string]string) {
+	writeStatusWithin(c, code, reason, extra, statusWriteTimeout)
+}
+
+func writeStatusWithin(c net.Conn, code int, reason string, extra map[string]string, timeout time.Duration) {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "HTTP/1.1 %d %s\r\n", code, reason)
 	for k, v := range extra {
 		fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
 	}
 	sb.WriteString("Content-Length: 0\r\nConnection: close\r\n\r\n")
-	c.SetWriteDeadline(time.Now().Add(statusWriteTimeout))
+	c.SetWriteDeadline(time.Now().Add(timeout))
 	_, _ = io.WriteString(c, sb.String())
 }
 
@@ -307,12 +324,6 @@ func readLineLimited(br *bufio.Reader, max int) (string, error) {
 func (s *Server) handleConn(raw net.Conn) {
 	// Hold a pending slot until this connection either fails or becomes a
 	// tunnel. Past that point max_active governs.
-	select {
-	case s.pending <- struct{}{}:
-	default:
-		writeStatus(raw, 503, "Overloaded", nil)
-		return
-	}
 	var releaseOnce sync.Once
 	releasePending := func() { releaseOnce.Do(func() { <-s.pending }) }
 	defer releasePending()
@@ -337,6 +348,7 @@ func (s *Server) handleConn(raw net.Conn) {
 	}
 	authority := parts[1]
 	var proxyAuth string
+	var sawProxyAuth bool
 	total := 0
 	for {
 		line, err := readLineLimited(br, maxHeaderBytes)
@@ -355,7 +367,7 @@ func (s *Server) handleConn(raw net.Conn) {
 			break
 		}
 		idx := strings.Index(line, ":")
-		if idx <= 0 {
+		if idx <= 0 || strings.TrimSpace(line[:idx]) != line[:idx] {
 			writeStatus(raw, 400, "Bad Request", nil)
 			return
 		}
@@ -364,23 +376,17 @@ func (s *Server) handleConn(raw net.Conn) {
 		if strings.EqualFold(name, "Proxy-Authorization") {
 			// Two credentials in one request is ambiguous; refuse rather than
 			// silently picking the last one.
-			if proxyAuth != "" {
+			if sawProxyAuth {
 				writeStatus(raw, 400, "Bad Request", nil)
 				return
 			}
 			proxyAuth = val
+			sawProxyAuth = true
 		}
 	}
 	auth, err := access.Authenticate(s.cfg, proxyAuth)
 	if err != nil {
 		writeStatus(raw, 407, "Proxy Auth Required", map[string]string{"Proxy-Authenticate": "Basic realm=\"gateway\""})
-		return
-	}
-	ctx, cancel := context.WithTimeout(s.forceCtx, s.dialTimeout)
-	target, err := s.policy.AuthorizeTarget(ctx, authority)
-	cancel()
-	if err != nil {
-		writeStatus(raw, 403, "Forbidden", nil)
 		return
 	}
 	if err := s.lim.acquire(auth.ClientID); err != nil {
@@ -392,13 +398,21 @@ func (s *Server) handleConn(raw net.Conn) {
 		return
 	}
 	defer s.lim.release(auth.ClientID)
+	ctx, cancel := context.WithTimeout(s.forceCtx, s.dialTimeout)
+	target, err := s.policy.AuthorizeTarget(ctx, authority)
+	cancel()
+	if err != nil {
+		writeStatus(raw, 403, "Forbidden", nil)
+		return
+	}
 	dialCtx, dialCancel := context.WithTimeout(s.forceCtx, s.dialTimeout+time.Duration(s.cfg.Timeouts.HandshakeMs)*time.Millisecond)
-	defer dialCancel()
 	up, upBuffered, err := s.dialer.Dial(dialCtx, target)
+	dialCancel()
 	if err != nil {
 		writeStatus(raw, 502, "Bad Gateway", nil)
 		// The cause stays in the gateway log; the client only ever sees 502.
-		log.Printf("[gateway] client=%s host=%s dial failed: %v", auth.ClientID, target.Hostname, err)
+		// Avoid logging arbitrary proxy/DNS errors which may echo credentials.
+		log.Printf("[gateway] client=%s host=%s dial failed", auth.ClientID, target.Hostname)
 		return
 	}
 	// Tracked so shutdown can force-close the upstream leg too; otherwise the
@@ -440,44 +454,15 @@ func (s *Server) handleConn(raw net.Conn) {
 	log.Printf("[gateway] client=%s host=%s tunnel close c2u=%d u2c=%d", auth.ClientID, target.Hostname, c2u, u2c)
 }
 
-// relayTunnel copies opaque bytes both ways. A direction that outlives its
-// peer is bounded by tunnel_idle_ms, and by the force-close in drain().
-func relayTunnel(a, b net.Conn, idle time.Duration, bufSize int) (int64, int64) {
-	var c1, c2 int64
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); c1 = copyWithIdle(b, a, idle, bufSize) }()
-	go func() { defer wg.Done(); c2 = copyWithIdle(a, b, idle, bufSize) }()
-	wg.Wait()
-	return c1, c2
-}
-
-func copyWithIdle(dst, src net.Conn, idle time.Duration, bufSize int) int64 {
-	if bufSize <= 0 {
-		bufSize = 32 * 1024
-	}
-	buf := make([]byte, bufSize)
-	var total int64
-	for {
-		if idle > 0 {
-			_ = src.SetReadDeadline(time.Now().Add(idle))
-		}
-		n, rerr := src.Read(buf)
-		if n > 0 {
-			_ = dst.SetWriteDeadline(time.Now().Add(relayWriteTimeout))
-			if _, werr := dst.Write(buf[:n]); werr != nil {
-				break
-			}
-			total += int64(n)
-		}
-		if rerr != nil {
-			break
-		}
-	}
-	return total
-}
-
 func (s *Server) ActiveCount() int {
 	n, _ := s.lim.counts()
 	return n
+}
+
+func (s *Server) PendingCount() int { return len(s.pending) }
+
+func (s *Server) ConnectionCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.active)
 }

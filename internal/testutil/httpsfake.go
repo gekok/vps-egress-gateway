@@ -35,9 +35,7 @@ func StartFakeHTTPSUpstream(t *testing.T, mode, targetAddr, username, password s
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &FakeUpstream{Listener: ln, Addr: ln.Addr().String(), Mode: mode, TargetAddr: targetAddr, Username: username, Password: password, closed: make(chan struct{})}
-	f.wg.Add(1)
-	go f.serve()
-	t.Cleanup(func() { f.Close() })
+	f := &FakeUpstream{Listener: ln, Addr: ln.Addr().String(), Mode: mode, TargetAddr: targetAddr, Username: username, Password: password}
+	f.stop = Serve(t, ln, f.handle)
 	return f, caPEM
 }

@@ -201,7 +201,7 @@ func TestRejectsOversizedPendingCap(t *testing.T) {
 		}
 	}
 	// The derived default must stay inside the bound too.
-	cfg := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 60000, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
+	cfg := `{"listen_addr": "127.0.0.1:8080", "clients": [{"id": "a", "secret_env": "S"}], "allowlist": ["example.com"], "upstream": {"protocol": "http", "host": "127.0.0.1", "port": 3128}, "limits": {"max_active": 4096, "max_pending_per_client": 1, "max_new_per_second": 1}, "timeouts": {"read_header_ms": 1, "dial_ms": 1, "handshake_ms": 1, "tunnel_idle_ms": 1}}`
 	p := writeTempConfig(t, cfg, map[string]string{"S": "x"})
 	loaded, err := Load(p)
 	if err != nil {

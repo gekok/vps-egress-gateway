@@ -28,15 +28,17 @@ type httpDialer struct {
 }
 
 func (d *httpDialer) Dial(ctx context.Context, target access.Target) (net.Conn, []byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, d.timeout)
-	defer cancel()
 	conn, err := d.dial(ctx, "tcp", d.upstreamAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial upstream %s: %w", d.upstreamAddr, err)
 	}
+	ctx, cancel := context.WithTimeout(ctx, d.timeout)
+	defer cancel()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
+	finish := guardHandshake(ctx, conn)
+	defer finish()
 	port := strconv.Itoa(target.Port)
 	targetAddr := net.JoinHostPort(target.PinnedIP.String(), port)
 	var sb strings.Builder
@@ -53,7 +55,6 @@ func (d *httpDialer) Dial(ctx context.Context, target access.Target) (net.Conn, 
 	}
 	br := bufio.NewReaderSize(conn, 8192)
 	code, err := readConnectStatus(br, maxUpstreamHeaderBytes)
-	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
 		conn.Close()
 		return nil, nil, err
@@ -72,7 +73,13 @@ func (d *httpDialer) Dial(ctx context.Context, target access.Target) (net.Conn, 
 		early = append([]byte(nil), peeked...)
 		_, _ = br.Discard(n)
 	}
-	return &bufferedConn{Conn: conn, reader: br}, early, nil
+	if err := finish(); err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("finish upstream handshake: %w", err)
+	}
+	// The reader is now empty; returning the underlying connection also keeps
+	// TCP/TLS CloseWrite available for a half-closed tunnel.
+	return conn, early, nil
 }
 
 var errLineTooLong = errors.New("line too long")
@@ -120,23 +127,12 @@ func readConnectStatus(br *bufio.Reader, maxHeader int) (int, error) {
 	}
 	s := strings.TrimSpace(statusLine)
 	parts := strings.SplitN(s, " ", 3)
-	if len(parts) < 2 || len(parts[0]) < 5 || parts[0][:5] != "HTTP/" {
+	if len(parts) < 2 || (parts[0] != "HTTP/1.1" && parts[0] != "HTTP/1.0") {
 		return 0, fmt.Errorf("malformed upstream response")
 	}
 	code, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if err != nil || code <= 0 {
+	if err != nil || len(parts[1]) != 3 || code < 100 || code > 599 {
 		return 0, fmt.Errorf("malformed upstream status")
 	}
 	return code, nil
-}
-
-// bufferedConn keeps reads flowing through the bufio.Reader used for the
-// CONNECT handshake, so bytes it already buffered are not lost.
-type bufferedConn struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (c *bufferedConn) Read(b []byte) (int, error) {
-	return c.reader.Read(b)
 }

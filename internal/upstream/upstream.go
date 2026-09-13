@@ -33,6 +33,12 @@ func NewDialerWithNet(cfg *config.Config, dial func(ctx context.Context, network
 		d := &net.Dialer{Timeout: dm}
 		base = d.DialContext
 	}
+	transportDial := base
+	base = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialCtx, cancel := context.WithTimeout(ctx, dm)
+		defer cancel()
+		return transportDial(dialCtx, network, addr)
+	}
 	user, pass := cfg.UpstreamCredentials()
 	addr := net.JoinHostPort(cfg.Upstream.Host, strconv.Itoa(cfg.Upstream.Port))
 	switch cfg.Upstream.Protocol {

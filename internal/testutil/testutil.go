@@ -18,8 +18,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/gekok/vps-egress-gateway/internal/access"
 )
 
 type FakeResolver struct {
@@ -79,8 +77,7 @@ type FakeUpstream struct {
 	GotAuth    []string
 	GotDest    []string
 	mu         sync.Mutex
-	wg         sync.WaitGroup
-	closed     chan struct{}
+	stop       func()
 }
 
 func StartFakeHTTPUpstream(t *testing.T, mode, targetAddr, username, password string) *FakeUpstream {
@@ -89,37 +86,13 @@ func StartFakeHTTPUpstream(t *testing.T, mode, targetAddr, username, password st
 	if err != nil {
 		t.Fatalf("listen fake upstream: %v", err)
 	}
-	f := &FakeUpstream{Listener: ln, Addr: ln.Addr().String(), Mode: mode, TargetAddr: targetAddr, Username: username, Password: password, closed: make(chan struct{})}
-	f.wg.Add(1)
-	go f.serve()
-	t.Cleanup(func() { f.Close() })
+	f := &FakeUpstream{Listener: ln, Addr: ln.Addr().String(), Mode: mode, TargetAddr: targetAddr, Username: username, Password: password}
+	f.stop = Serve(t, ln, f.handle)
 	return f
 }
 
 func (f *FakeUpstream) Close() {
-	select {
-	case <-f.closed:
-	default:
-		close(f.closed)
-		f.Listener.Close()
-		f.wg.Wait()
-	}
-}
-
-func (f *FakeUpstream) serve() {
-	defer f.wg.Done()
-	for {
-		c, err := f.Listener.Accept()
-		if err != nil {
-			return
-		}
-		f.wg.Add(1)
-		go func(conn net.Conn) {
-			defer f.wg.Done()
-			defer conn.Close()
-			f.handle(conn)
-		}(c)
-	}
+	f.stop()
 }
 
 func (f *FakeUpstream) handle(conn net.Conn) {
@@ -176,6 +149,9 @@ func (f *FakeUpstream) handle(conn net.Conn) {
 			}
 			defer up.Close()
 			conn.SetDeadline(time.Time{})
+			if _, err := io.CopyN(up, br, int64(br.Buffered())); err != nil {
+				return
+			}
 			relay(conn, up)
 			return
 		}
@@ -231,8 +207,19 @@ func echoConn(conn net.Conn, br *bufio.Reader) {
 func relay(a, b net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); io.Copy(b, a); tryClose(a); tryClose(b) }()
-	go func() { defer wg.Done(); io.Copy(a, b); tryClose(a); tryClose(b) }()
+	copyOne := func(dst, src net.Conn) {
+		defer wg.Done()
+		_, err := io.Copy(dst, src)
+		if err == nil {
+			if half, ok := dst.(interface{ CloseWrite() error }); ok && half.CloseWrite() == nil {
+				return
+			}
+		}
+		tryClose(a)
+		tryClose(b)
+	}
+	go copyOne(b, a)
+	go copyOne(a, b)
 	wg.Wait()
 }
 
@@ -250,20 +237,7 @@ func StartEchoServer(t *testing.T, marker string) string {
 	if err != nil {
 		t.Fatalf("listen echo: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(conn net.Conn) {
-				defer conn.Close()
-				io.WriteString(conn, marker+"\n")
-				io.Copy(conn, conn)
-			}(c)
-		}
-	}()
+	Serve(t, ln, func(conn net.Conn) { io.WriteString(conn, marker+"\n"); io.Copy(conn, conn) })
 	return ln.Addr().String()
 }
 
@@ -309,20 +283,7 @@ func StartTLSEchoServer(t *testing.T, marker string) (string, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(conn net.Conn) {
-				defer conn.Close()
-				io.WriteString(conn, marker+"\n")
-				io.Copy(conn, conn)
-			}(c)
-		}
-	}()
+	Serve(t, ln, func(conn net.Conn) { io.WriteString(conn, marker+"\n"); io.Copy(conn, conn) })
 	return ln.Addr().String(), caPEM
 }
 
@@ -341,29 +302,7 @@ func StartSilentTCP(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("listen silent: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
-	var mu sync.Mutex
-	var held []net.Conn
-	done := make(chan struct{})
-	t.Cleanup(func() {
-		close(done)
-		mu.Lock()
-		for _, c := range held {
-			c.Close()
-		}
-		mu.Unlock()
-	})
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			mu.Lock()
-			held = append(held, c)
-			mu.Unlock()
-		}
-	}()
+	Serve(t, ln, func(conn net.Conn) { io.Copy(io.Discard, conn) })
 	return ln.Addr().String()
 }
 
@@ -375,26 +314,20 @@ func StartUnterminatedHeader(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("listen unterminated: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
-	go func() {
+	Serve(t, ln, func(conn net.Conn) {
+		junk := []byte(strings.Repeat("A", 4096))
 		for {
-			c, err := ln.Accept()
-			if err != nil {
+			conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			if _, err := conn.Write(junk); err != nil {
 				return
 			}
-			go func(conn net.Conn) {
-				defer conn.Close()
-				junk := []byte(strings.Repeat("A", 4096))
-				for {
-					conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-					if _, err := conn.Write(junk); err != nil {
-						return
-					}
-				}
-			}(c)
 		}
-	}()
+	})
 	return ln.Addr().String()
 }
 
-var _ = access.SystemResolver
+func (f *FakeUpstream) Authorizations() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.GotAuth...)
+}

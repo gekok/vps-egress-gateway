@@ -25,7 +25,8 @@ Rules:
 - Every acquire has exactly one release; every conn closed; no secret in logs.
 - Early bytes the upstream packs in with its CONNECT response are handed to the
   caller exactly once; the tunnel must never replay them.
-- Every upstream handshake runs under a deadline, and every conn (client and
+- Every upstream handshake runs under a deadline and reacts to context
+  cancellation; every conn (client and
   upstream leg) is tracked so shutdown can force-close it. Once drain starts
   force-closing, in-flight DNS and dials are cancelled and no new conn is
   tracked, so no handler can outlive the drain window.
@@ -38,3 +39,6 @@ Rules:
 - Request line and header reads are byte-capped, so a peer that never sends a
   newline cannot grow a buffer without bound.
 - TLS content stays opaque; gateway never terminates client TLS.
+- Tunnel idle means no byte in either direction for `tunnel_idle_ms`. A client
+  upload FIN is propagated to an upstream TCP connection when supported while
+  its response direction stays open; unsupported transports close safely.

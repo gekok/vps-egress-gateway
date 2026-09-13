@@ -444,7 +444,9 @@ func TestPendingHandshakesAreCapped(t *testing.T) {
 	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(3 * time.Second))
-	io.WriteString(c, "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: "+basicAuth("pc-01", "secret-a")+"\r\n\r\n")
+	// The overload check runs immediately after Accept, before the gateway
+	// reads a request. Keep this peer silent: closing a socket with unread
+	// client data can turn the response into a TCP reset on Windows.
 	br := bufio.NewReader(c)
 	status, err := br.ReadString('\n')
 	if err != nil {

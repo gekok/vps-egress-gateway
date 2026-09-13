@@ -16,8 +16,29 @@ Ownership:
 - internal/testutil + tests/integration own fakes and regression matrix.
 
 Rules:
-- No direct dial to destination; pinned IP from policy is the only dial target.
+- No direct dial to destination; pinned IP from policy is the only dial target,
+  and every upstream socket is pinned to the configured upstream address.
+- A destination address must be public under the reserved-range table in
+  internal/access, which covers IPv6 formats that embed an IPv4 address.
 - Client credential never goes upstream; upstream credential never enters tunnel/log.
 - 200 only after upstream success; after 200, close tunnel instead of HTTP/JSON.
 - Every acquire has exactly one release; every conn closed; no secret in logs.
+- Early bytes the upstream packs in with its CONNECT response are handed to the
+  caller exactly once; the tunnel must never replay them.
+- Every upstream handshake runs under a deadline and reacts to context
+  cancellation; every conn (client and
+  upstream leg) is tracked so shutdown can force-close it. Once drain starts
+  force-closing, in-flight DNS and dials are cancelled and no new conn is
+  tracked, so no handler can outlive the drain window.
+- Connections accepted but not yet relaying are capped by
+  limits.max_pending_handshakes, which is bounded so it cannot be set so high
+  that it stops being a cap. The cap applies after accept; pre-accept limiting
+  is an infrastructure concern for M2.
+- A client id must be [A-Za-z0-9._-]{1,64}: it is written to the gateway log
+  verbatim, so it must not be able to forge a log line or carry escapes.
+- Request line and header reads are byte-capped, so a peer that never sends a
+  newline cannot grow a buffer without bound.
 - TLS content stays opaque; gateway never terminates client TLS.
+- Tunnel idle means no byte in either direction for `tunnel_idle_ms`. A client
+  upload FIN is propagated to an upstream TCP connection when supported while
+  its response direction stays open; unsupported transports close safely.

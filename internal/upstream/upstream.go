@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 
 	"github.com/gekok/vps-egress-gateway/internal/access"
@@ -12,12 +13,6 @@ import (
 
 type Dialer interface {
 	Dial(ctx context.Context, target access.Target) (net.Conn, []byte, error)
-}
-
-type Factory struct {
-	Cfg         *config.Config
-	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-	Timeout     time.Duration
 }
 
 func NewDialer(cfg *config.Config) (Dialer, error) {
@@ -38,8 +33,14 @@ func NewDialerWithNet(cfg *config.Config, dial func(ctx context.Context, network
 		d := &net.Dialer{Timeout: dm}
 		base = d.DialContext
 	}
+	transportDial := base
+	base = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialCtx, cancel := context.WithTimeout(ctx, dm)
+		defer cancel()
+		return transportDial(dialCtx, network, addr)
+	}
 	user, pass := cfg.UpstreamCredentials()
-	addr := fmt.Sprintf("%s:%d", cfg.Upstream.Host, cfg.Upstream.Port)
+	addr := net.JoinHostPort(cfg.Upstream.Host, strconv.Itoa(cfg.Upstream.Port))
 	switch cfg.Upstream.Protocol {
 	case config.ProtocolHTTP:
 		return &httpDialer{upstreamAddr: addr, username: user, password: pass, dial: base, timeout: hs}, nil

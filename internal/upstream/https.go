@@ -23,12 +23,12 @@ type httpsDialer struct {
 }
 
 func (d *httpsDialer) Dial(ctx context.Context, target access.Target) (net.Conn, []byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, d.timeout)
-	defer cancel()
 	raw, err := d.dial(ctx, "tcp", d.upstreamAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial upstream: %w", err)
 	}
+	ctx, cancel := context.WithTimeout(ctx, d.timeout)
+	defer cancel()
 	tlsCfg := &tls.Config{ServerName: d.serverName, MinVersion: tls.VersionTLS12}
 	if d.caFile != "" {
 		pemData, err := os.ReadFile(d.caFile)
@@ -50,10 +50,6 @@ func (d *httpsDialer) Dial(ctx context.Context, target access.Target) (net.Conn,
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		raw.Close()
 		return nil, nil, fmt.Errorf("tls handshake to upstream: %w", err)
-	}
-	if err := tlsConn.VerifyHostname(d.serverName); err != nil {
-		raw.Close()
-		return nil, nil, fmt.Errorf("upstream certificate verify: %w", err)
 	}
 	inner := &httpDialer{upstreamAddr: d.upstreamAddr, username: d.username, password: d.password, dial: func(c context.Context, n, a string) (net.Conn, error) { return tlsConn, nil }, timeout: d.timeout}
 	conn, buffered, err := inner.Dial(ctx, target)

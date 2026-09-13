@@ -18,8 +18,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/gekok/vps-egress-gateway/internal/access"
 )
 
 type FakeResolver struct {
@@ -77,9 +75,9 @@ type FakeUpstream struct {
 	Username   string
 	Password   string
 	GotAuth    []string
+	GotDest    []string
 	mu         sync.Mutex
-	wg         sync.WaitGroup
-	closed     chan struct{}
+	stop       func()
 }
 
 func StartFakeHTTPUpstream(t *testing.T, mode, targetAddr, username, password string) *FakeUpstream {
@@ -88,37 +86,13 @@ func StartFakeHTTPUpstream(t *testing.T, mode, targetAddr, username, password st
 	if err != nil {
 		t.Fatalf("listen fake upstream: %v", err)
 	}
-	f := &FakeUpstream{Listener: ln, Addr: ln.Addr().String(), Mode: mode, TargetAddr: targetAddr, Username: username, Password: password, closed: make(chan struct{})}
-	f.wg.Add(1)
-	go f.serve()
-	t.Cleanup(func() { f.Close() })
+	f := &FakeUpstream{Listener: ln, Addr: ln.Addr().String(), Mode: mode, TargetAddr: targetAddr, Username: username, Password: password}
+	f.stop = Serve(t, ln, f.handle)
 	return f
 }
 
 func (f *FakeUpstream) Close() {
-	select {
-	case <-f.closed:
-	default:
-		close(f.closed)
-		f.Listener.Close()
-		f.wg.Wait()
-	}
-}
-
-func (f *FakeUpstream) serve() {
-	defer f.wg.Done()
-	for {
-		c, err := f.Listener.Accept()
-		if err != nil {
-			return
-		}
-		f.wg.Add(1)
-		go func(conn net.Conn) {
-			defer f.wg.Done()
-			defer conn.Close()
-			f.handle(conn)
-		}(c)
-	}
+	f.stop()
 }
 
 func (f *FakeUpstream) handle(conn net.Conn) {
@@ -156,6 +130,7 @@ func (f *FakeUpstream) handle(conn net.Conn) {
 	}
 	f.mu.Lock()
 	f.GotAuth = append(f.GotAuth, auth)
+	f.GotDest = append(f.GotDest, dest)
 	f.mu.Unlock()
 	if f.Username != "" {
 		want := "Basic " + base64.StdEncoding.EncodeToString([]byte(f.Username+":"+f.Password))
@@ -166,10 +141,6 @@ func (f *FakeUpstream) handle(conn net.Conn) {
 	}
 	switch f.Mode {
 	case "ok":
-		extra := ""
-		if strings.HasPrefix(dest, "buffered") || true {
-		}
-		_ = extra
 		io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 		if f.TargetAddr != "" {
 			up, err := net.DialTimeout("tcp", f.TargetAddr, 5*time.Second)
@@ -178,6 +149,9 @@ func (f *FakeUpstream) handle(conn net.Conn) {
 			}
 			defer up.Close()
 			conn.SetDeadline(time.Time{})
+			if _, err := io.CopyN(up, br, int64(br.Buffered())); err != nil {
+				return
+			}
 			relay(conn, up)
 			return
 		}
@@ -233,8 +207,19 @@ func echoConn(conn net.Conn, br *bufio.Reader) {
 func relay(a, b net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); io.Copy(b, a); tryClose(a); tryClose(b) }()
-	go func() { defer wg.Done(); io.Copy(a, b); tryClose(a); tryClose(b) }()
+	copyOne := func(dst, src net.Conn) {
+		defer wg.Done()
+		_, err := io.Copy(dst, src)
+		if err == nil {
+			if half, ok := dst.(interface{ CloseWrite() error }); ok && half.CloseWrite() == nil {
+				return
+			}
+		}
+		tryClose(a)
+		tryClose(b)
+	}
+	go copyOne(b, a)
+	go copyOne(a, b)
 	wg.Wait()
 }
 
@@ -252,20 +237,7 @@ func StartEchoServer(t *testing.T, marker string) string {
 	if err != nil {
 		t.Fatalf("listen echo: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(conn net.Conn) {
-				defer conn.Close()
-				io.WriteString(conn, marker+"\n")
-				io.Copy(conn, conn)
-			}(c)
-		}
-	}()
+	Serve(t, ln, func(conn net.Conn) { io.WriteString(conn, marker+"\n"); io.Copy(conn, conn) })
 	return ln.Addr().String()
 }
 
@@ -311,21 +283,51 @@ func StartTLSEchoServer(t *testing.T, marker string) (string, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(conn net.Conn) {
-				defer conn.Close()
-				io.WriteString(conn, marker+"\n")
-				io.Copy(conn, conn)
-			}(c)
-		}
-	}()
+	Serve(t, ln, func(conn net.Conn) { io.WriteString(conn, marker+"\n"); io.Copy(conn, conn) })
 	return ln.Addr().String(), caPEM
 }
 
-var _ = access.SystemResolver
+// Destinations returns the CONNECT targets this fake upstream was asked for.
+func (f *FakeUpstream) Destinations() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.GotDest...)
+}
+
+// StartSilentTCP accepts connections and then never writes a byte, modelling an
+// upstream that completes the TCP handshake and then goes dark.
+func StartSilentTCP(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen silent: %v", err)
+	}
+	Serve(t, ln, func(conn net.Conn) { io.Copy(io.Discard, conn) })
+	return ln.Addr().String()
+}
+
+// StartUnterminatedHeader answers a CONNECT with bytes that never contain a
+// newline, modelling an upstream that can exhaust a naive line reader.
+func StartUnterminatedHeader(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen unterminated: %v", err)
+	}
+	Serve(t, ln, func(conn net.Conn) {
+		junk := []byte(strings.Repeat("A", 4096))
+		for {
+			conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			if _, err := conn.Write(junk); err != nil {
+				return
+			}
+		}
+	})
+	return ln.Addr().String()
+}
+
+func (f *FakeUpstream) Authorizations() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.GotAuth...)
+}
